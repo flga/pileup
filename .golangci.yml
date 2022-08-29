@@ -1,0 +1,38 @@
+run:
+  timeout: 10m
+
+linters:
+  enable:
+    - errcheck
+    - bodyclose
+    - deadcode
+    - depguard
+    - errname
+    - gofmt
+    - goimports
+    - gosimple
+    - govet
+    - ineffassign
+    - misspell
+    - revive
+    - staticcheck
+    - structcheck
+    - typecheck
+    - unused
+    - varcheck
+    - whitespace
+    - godox
+    - golint # some linters are borked when using cgo, including revive
+  disable-all: true
+
+linters-settings:
+  depguard:
+    list-type: blacklist
+    include-go-root: true
+    packages:
+      - io/ioutil # The io/ioutil package has been deprecated, https://go.dev/doc/go1.16#ioutil
+  govet:
+    check-shadowing: false
+    enable-all: true
+    disable:
+      - shadow
