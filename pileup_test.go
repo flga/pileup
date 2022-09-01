@@ -1,7 +1,7 @@
 // Copyright 2013 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
-package zflight
+package pileup
 
 import (
 	"errors"
@@ -14,50 +14,48 @@ import (
 func newValue() int          { return 0 }
 func resetValue(v *int) bool { *v = 0; return true }
 
-func TestSingleflightRace(t *testing.T) {
+func TestRace(t *testing.T) {
 	g := New[string](newValue, resetValue)
-	const n = 1000
-	const m = 100
+
+	const n, m = 1000, 100
+	var sum, calls uint64
+
 	var wg sync.WaitGroup
 	wg.Add(n)
-	var sum, calls, refs int64
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < m; i++ {
-				ref, _, actualRefs, _ := g.doInternal("asd", func(w *int) error {
+				ref, _, _ := g.Do("asd", func(w *int) error {
 					*w = 42
-					atomic.AddInt64(&calls, 1)
+					atomic.AddUint64(&calls, 1)
 					return nil
 				})
-				atomic.AddInt64(&sum, int64(ref.Value))
-				if actualRefs > 0 {
-					atomic.AddInt64(&refs, actualRefs)
-				}
+				atomic.AddUint64(&sum, uint64(ref.Value))
 				ref.Release()
 			}
 		}()
 	}
 	wg.Wait()
-	if want := int64(n * m * 42); sum != want {
+	if want := uint64(n * m * 42); sum != want {
 		t.Errorf("sum = %d, want %d", sum, want)
 	}
-	if wantMax := int64(m * n); calls > wantMax {
+	if wantMax := uint64(m * n); calls > wantMax {
 		t.Errorf("calls = %d, want at most %d", calls, wantMax)
 	}
-	if want := int64(m * n); refs != want {
-		t.Errorf("refs = %d, want %d", refs, want)
+	if want := uint64(m * n); g.issued != want {
+		t.Errorf("refs = %d, want %d", g.issued, want)
 	}
 
 	if g.issued != g.releases {
-		t.Errorf("leaking issued writers, issued = %v, release calls = %v", g.issued, g.releases)
+		t.Errorf("leaking issued refs, issued = %d, release calls = %d", g.issued, g.releases)
 	}
 	if g.created != g.freed {
-		t.Errorf("leaking created writers, created = %v, freed = %v", g.created, g.freed)
+		t.Errorf("leaking created refs, created = %d, freed = %d", g.created, g.freed)
 	}
 }
 
-func TestSingleflightDo(t *testing.T) {
+func TestDo(t *testing.T) {
 	g := New[string](newValue, resetValue)
 	got, _, err := g.Do("key", func(w *int) error {
 		*w = 42
@@ -74,7 +72,7 @@ func TestSingleflightDo(t *testing.T) {
 	}
 }
 
-func TestSingleflightDoErr(t *testing.T) {
+func TestDoErr(t *testing.T) {
 	g := New[string](newValue, resetValue)
 	someErr := errors.New("Some error")
 	got, _, err := g.Do("key", func(w *int) error {
@@ -88,7 +86,7 @@ func TestSingleflightDoErr(t *testing.T) {
 	}
 }
 
-func TestSingleflightDoDupSuppress(t *testing.T) {
+func TestDoDupSuppress(t *testing.T) {
 	g := New[string](newValue, resetValue)
 	var wg1, wg2 sync.WaitGroup
 	c := make(chan int, 1)
@@ -139,7 +137,7 @@ func TestSingleflightDoDupSuppress(t *testing.T) {
 
 // Test singleflight behaves correctly after Do panic.
 // See https://github.com/golang/go/issues/41133
-func TestSingleflightPanicDo(t *testing.T) {
+func TestPanicDo(t *testing.T) {
 	g := New[string](newValue, resetValue)
 	fn := func(w *int) error {
 		panic("invalid memory address or nil pointer dereference")

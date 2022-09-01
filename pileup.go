@@ -2,12 +2,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package zflight provides a duplicate function call suppression mechanism.
+// Package pileup provides a duplicate function call suppression mechanism.
 //
 // It is a specialization of [golang.org/x/sync/singleflight] designed to enable
-// zero allocation mode on top of thundering herd protection by pooling and
+// zero-ish allocation mode on top of thundering herd protection by pooling and
 // refcounting the values shared amongst peers.
-package zflight
+package pileup
 
 import (
 	"fmt"
@@ -18,8 +18,8 @@ import (
 
 // Ref wraps T and adds reference counting to it.
 //
-// A Ref[T] will be shared by any callers that got suppressed (including the
-// original requester).
+// A Ref[T] will be shared by any callers that got suppressed along with the
+// original requester.
 type Ref[T any] struct {
 	// Handles to the group that created us, used for returning Ref back to the
 	// pool and keeping track of debug metrics. Internal.
@@ -54,13 +54,17 @@ type Ref[T any] struct {
 // it when done.
 func (r *Ref[T]) Release() {
 	// must not mutate flight state.
-	atomic.AddUint64(r.gReleases, 1)
+	if EnableMetrics {
+		atomic.AddUint64(r.gReleases, 1)
+	}
 
 	if atomic.AddInt64(&r.refs, -1) > 0 {
 		return
 	}
 
-	atomic.AddUint64(r.gFreed, 1)
+	if EnableMetrics {
+		atomic.AddUint64(r.gFreed, 1)
+	}
 	if r.reset(&r.Value) {
 		r.gPool.Put(r)
 	}
@@ -87,6 +91,9 @@ type Group[K comparable, T any] struct {
 // constructor is used to create a new T, it should not return a pointer.
 // reset is used to clear any transient state of T, the return value indicates
 // whether T is eligble to be put back in the pool.
+//
+// If you're allocating dynamically sized objects like buffers, you can drop
+// the value by returning false.
 func New[K comparable, T any](constructor func() T, reset func(*T) bool) *Group[K, T] {
 	g := &Group[K, T]{
 		m:    make(map[K]*Ref[T]),
@@ -112,86 +119,90 @@ func New[K comparable, T any](constructor func() T, reset func(*T) bool) *Group[
 // original to complete and receives the same results.
 //
 // The return value leader indicates whether this was the first call.
+//
+// If the inner function returns an error, it will be propagated.
+// Do will return either a Ref[T] or an error, but never both.
 func (g *Group[K, T]) Do(key K, fn func(*T) error) (ref *Ref[T], leader bool, err error) {
-	ref, leader, _, err = g.doInternal(key, fn)
-	return ref, leader, err
-}
-
-func (g *Group[K, T]) doInternal(key K, fn func(*T) error) (*Ref[T], bool, int64, error) {
 	g.mu.Lock()
-	if w, ok := g.m[key]; ok {
-		w.refs++
+	if ref, ok := g.m[key]; ok {
+		ref.refs++
 		g.mu.Unlock()
-		w.wg.Wait()
+		ref.wg.Wait()
 
 		// SAFETY:
 		// Any caller in-flight is guaranteed to either not see the current call
-		// or to have written to w already. doCall will only mark the wg as done
+		// or to have written to ref already. doCall will only mark the wg as done
 		// after deleting it from the map (while holding the lock).
 		//
 		// This is guaranteed to happen after any current callers have written
-		// to w (because they released the lock) or before new callers acquire
+		// to ref (because they released the lock) or before new callers acquire
 		// the lock (in which case they will not see the current call since
 		// doCall deleted it).
 		//
 		// This flow ensures that every call to Do that gets coalesced (including
 		// the leader) sees the same ref count, it is not sufficient to rely on
-		// the fact that they use the same instance of w, we must ensure that
-		// no new callers are allowed to see w after it is complete.
+		// the fact that they use the same instance of ref, we must ensure that
+		// no new callers are allowed to see ref after it is complete.
 		//
-		// It is not safe to mutate w at this point because the caller may
+		// It is not safe to mutate ref at this point because the caller may
 		// already hold a reference to it. It is safe to read but not write to
-		// sfErr (the caller cannot write to it).
-		if w.err != nil {
-			// This call must always be deferred.
-			// Calling release will eventually put w back in the pool, if a new
-			// caller comes in and takes this w out of the pool it will cause
-			// a race because we're still reading from it.
-			defer w.Release()
-			return nil, false, -1, w.err // only the leader can see refcount.
+		// err (the caller cannot write to it).
+		if ref.err != nil {
+			// Calling release will eventually put ref back in the pool, if a new
+			// caller comes in and takes this ref out of the pool it will cause
+			// a race because we're still reading from it. So read first, release after.
+			err = ref.err
+			ref.Release()
+			return nil, false, err
 		}
 
-		atomic.AddUint64(&g.issued, 1)
-		return w, false, -1, nil // only the leader can see refcount.
+		if EnableMetrics {
+			atomic.AddUint64(&g.issued, 1)
+		}
+		return ref, false, nil
 	}
 
-	// Acquire a new Writer, reset flight state and store it so that new callers
+	// Acquire a new Ref, reset flight state and store it so that new callers
 	// see it. The actual operation will happen without holding the lock to
 	// reduce contention. Special care must be taken to ensure that no invariant
 	// is violated after releasing the lock.
 	//
 	// See the SAFETY notice above, as well as in doCall.
-
-	ref := g.pool.Get().(*Ref[T])
+	ref = g.pool.Get().(*Ref[T])
 	ref.refs = 1
 	ref.err = nil
 	ref.wg.Add(1)
 	g.m[key] = ref
 	g.mu.Unlock()
 
-	atomic.AddUint64(&g.created, 1)
+	if EnableMetrics {
+		atomic.AddUint64(&g.created, 1)
+	}
 
-	refs := g.doCall(ref, key, fn)
+	g.doCall(ref, key, fn)
 	// The call is complete. Read the SAFETY note above. From this point on
 	// exactly the same circumstances apply since the two blocks are concurrent.
 
 	if ref.err != nil {
-		// This call must always be deferred.
-		// Calling release will eventually put w back in the pool, if a new
-		// caller comes in and takes this w out of the pool it will cause
-		// a race because we're still reading from it.
-		defer ref.Release()
-		return nil, true, -1, ref.err
+		// Calling release will eventually put ref back in the pool, if a new
+		// caller comes in and takes this ref out of the pool it will cause
+		// a race because we're still reading from it. So read first, release after.
+		err = ref.err
+		ref.Release()
+		return nil, true, err
 	}
 
-	atomic.AddUint64(&g.issued, 1)
-	return ref, true, refs, nil
+	if EnableMetrics {
+		atomic.AddUint64(&g.issued, 1)
+	}
+
+	return ref, true, nil
 }
 
 // doCall handles the single call for a key.
-func (g *Group[K, T]) doCall(ref *Ref[T], key K, fn func(*T) error) (refs int64) {
+func (g *Group[K, T]) doCall(ref *Ref[T], key K, fn func(*T) error) {
 	defer func() {
-		// It is guaranteed that we are the only writer to sfErr, it is also
+		// It is guaranteed that we are the only writer to err, it is also
 		// guaranteed that there are currently no readers because we've yet to
 		// return (which will allow the leader to read) and have not yet notified
 		// the waiters that the call is done.
@@ -201,8 +212,7 @@ func (g *Group[K, T]) doCall(ref *Ref[T], key K, fn func(*T) error) (refs int64)
 
 		g.mu.Lock()
 		// We hold the lock, so no new waiter is able to join the flight and
-		// any waiters are guaranteed to have written to flightRefs already.
-		refs = ref.refs // This is for testing purposes only.
+		// any waiters are guaranteed to have written to refs already.
 		delete(g.m, key)
 		g.mu.Unlock() // After this point, new callers will start a new flight.
 
@@ -211,7 +221,6 @@ func (g *Group[K, T]) doCall(ref *Ref[T], key K, fn func(*T) error) (refs int64)
 		ref.wg.Done()
 	}()
 	ref.err = fn(&ref.Value)
-	return 42 // meaningless, unconditionally overridden by defer.
 }
 
 // A panicError is an arbitrary value recovered from a panic
